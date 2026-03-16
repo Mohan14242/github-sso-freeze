@@ -47,10 +47,7 @@ export default function PipelineView({ runId, serviceName, environment, onClose,
   const [expandedLog, setExpandedLog] = useState(null)
   const cleanupRef                    = useRef(null)
   const timerRef                      = useRef(null)
-  // Track if this effect instance is still active (prevents stale async callbacks)
-  const mountedRef                    = useRef(true)
 
-  // 1-second tick to keep duration timers updating while a stage is running
   useEffect(() => {
     timerRef.current = setInterval(() => {
       setRun(prev => prev ? { ...prev, _tick: Date.now() } : prev)
@@ -58,32 +55,39 @@ export default function PipelineView({ runId, serviceName, environment, onClose,
     return () => clearInterval(timerRef.current)
   }, [])
 
+  // ─────────────────────────────────────────────────────────────────────────
+  // THE FIX: streamPipelineRun is now async (fetches /auth/sse-token first).
+  //
+  // OLD broken pattern:
+  //   const cleanup = streamPipelineRun(...)   ← assigns a Promise, not a fn
+  //   return () => { cleanup() }              ← TypeError: cleanup is not a function
+  //
+  // NEW correct pattern:
+  //   streamPipelineRun(...).then(cleanup => {
+  //     cleanupRef.current = cleanup           ← store the real cleanup fn
+  //   })
+  //   return () => { cleanupRef.current?.() } ← safe call via ref
+  //
+  // The `cancelled` flag handles the race where React unmounts the component
+  // before the async Promise resolves (e.g. user navigates away quickly).
+  // ─────────────────────────────────────────────────────────────────────────
   useEffect(() => {
     if (!runId) return
 
-    mountedRef.current = true
+    let cancelled = false
     setSseStatus("connecting")
     setLoading(true)
 
-    // ── KEY FIX ──────────────────────────────────────────────────────────────
-    // streamPipelineRun is now async because it first fetches /auth/sse-token
-    // to get the JWT as a readable string, then passes it as ?token= in the
-    // SSE URL. EventSource cannot set headers, and HttpOnly cookies are not
-    // sent cross-origin (React dev :5173 → backend :8080), so we need the
-    // token in the URL for the stream to authenticate correctly.
-    // ─────────────────────────────────────────────────────────────────────────
-    let didCleanup = false
-
     streamPipelineRun(runId, {
       onSnapshot: (event) => {
-        if (!mountedRef.current) return
+        if (cancelled) return
         const data = event.payload ?? event
         setRun(data)
         setLoading(false)
         setSseStatus("live")
       },
       onStageUpdated: (event) => {
-        if (!mountedRef.current) return
+        if (cancelled) return
         const stage = event.payload ?? event
         setRun(prev => {
           if (!prev) return prev
@@ -96,59 +100,54 @@ export default function PipelineView({ runId, serviceName, environment, onClose,
         })
       },
       onRunUpdated: (event) => {
-        if (!mountedRef.current) return
+        if (cancelled) return
         const data = event.payload ?? event
         setRun(prev => prev ? { ...prev, status: data.status, completedAt: data.completedAt } : prev)
       },
       onCompleted: (event) => {
-        if (!mountedRef.current) return
+        if (cancelled) return
         const data = event.payload ?? event
         setRun(prev => prev ? { ...prev, status: data.status, completedAt: data.completedAt } : prev)
         setSseStatus("completed")
         clearInterval(timerRef.current)
       },
       onError: () => {
-        if (!mountedRef.current) return
+        if (cancelled) return
         setSseStatus("error")
         setLoading(false)
-        // SSE failed — fall back to a one-shot REST fetch so the user
-        // at least sees the last known state
         fetchPipelineRun(runId)
-          .then(data => {
-            if (mountedRef.current) { setRun(data); setLoading(false) }
-          })
+          .then(data => { if (!cancelled) { setRun(data); setLoading(false) } })
           .catch(() => {})
       },
-    }).then(cleanup => {
-      // streamPipelineRun resolves with the cleanup function once the
-      // EventSource is set up
-      if (didCleanup) {
-        // component unmounted before the promise resolved — clean up immediately
-        cleanup?.()
+    })
+    .then(cleanup => {
+      // Promise resolved — store the real EventSource cleanup function
+      if (cancelled) {
+        cleanup?.()  // unmounted before Promise resolved, clean up immediately
       } else {
         cleanupRef.current = cleanup
       }
-    }).catch(err => {
-      // Failed to even set up the SSE (e.g. /auth/sse-token request failed)
+    })
+    .catch(err => {
+      // /auth/sse-token fetch failed or EventSource failed to set up
       console.error("[PipelineView] SSE setup failed:", err)
-      if (!mountedRef.current) return
+      if (cancelled) return
       setSseStatus("error")
       setLoading(false)
       fetchPipelineRun(runId)
-        .then(data => { if (mountedRef.current) { setRun(data); setLoading(false) } })
+        .then(data => { if (!cancelled) { setRun(data); setLoading(false) } })
         .catch(() => {})
     })
 
     return () => {
-      mountedRef.current = false
-      didCleanup = true
-      cleanupRef.current?.()
+      cancelled = true
+      cleanupRef.current?.()   // close the EventSource if it was opened
       cleanupRef.current = null
       clearInterval(timerRef.current)
     }
   }, [runId])
+  // ─────────────────────────────────────────────────────────────────────────
 
-  // Visible stages — respect stageFilter for rollback views
   const visibleStages = run?.stages
     ? (stageFilter?.length
         ? run.stages.filter(s => stageFilter.includes(s.stageName))
@@ -188,8 +187,6 @@ export default function PipelineView({ runId, serviceName, environment, onClose,
             display: "flex", alignItems: "center", gap: 8,
           }}>
             Pipeline Run #{runId}
-
-            {/* SSE status badge */}
             <span style={{
               display: "flex", alignItems: "center", gap: 4,
               padding: "2px 7px", borderRadius: 10,
@@ -217,7 +214,6 @@ export default function PipelineView({ runId, serviceName, environment, onClose,
               : "CONNECTING"}
             </span>
 
-            {/* Rollback badge */}
             {stageFilter?.length > 0 && (
               <span style={{
                 display: "flex", alignItems: "center", gap: 4,
@@ -315,7 +311,6 @@ export default function PipelineView({ runId, serviceName, environment, onClose,
               </div>
             </div>
 
-            {/* Rollback info strip */}
             {stageFilter?.length > 0 && (
               <div style={{
                 marginBottom: 16, padding: "8px 12px",
