@@ -11,11 +11,19 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 )
 
-const (
-	tokenDuration = 8 * time.Hour
-	// __Host- prefix enforces: Secure=true, Path=/, no Domain — prevents subdomain theft
-	cookieName = "__Host-platform-token"
-)
+const tokenDuration = 8 * time.Hour
+
+// cookieNameForEnv returns the correct cookie name based on environment.
+// In production (HTTPS), uses __Host- prefix which enforces:
+//   Secure=true, Path=/, no Domain — prevents subdomain cookie theft.
+// In local dev (HTTP, COOKIE_SECURE=false), uses a plain name because
+//   browsers silently drop __Host- cookies on non-HTTPS origins.
+func cookieNameForEnv() string {
+	if os.Getenv("COOKIE_SECURE") == "false" {
+		return "platform-token"
+	}
+	return "__Host-platform-token"
+}
 
 type Claims struct {
 	GithubLogin string   `json:"github_login"`
@@ -83,12 +91,12 @@ func ValidateJWT(tokenStr string) (*Claims, error) {
 	return claims, nil
 }
 
-// SetAuthCookie writes the JWT as an HttpOnly Secure SameSite=Lax cookie.
+// SetAuthCookie writes the JWT as an HttpOnly SameSite=Lax cookie.
 // Set COOKIE_SECURE=false in local dev (HTTP only).
 func SetAuthCookie(w http.ResponseWriter, token string) {
 	secure := os.Getenv("COOKIE_SECURE") != "false"
 	http.SetCookie(w, &http.Cookie{
-		Name:     cookieName,
+		Name:     cookieNameForEnv(),
 		Value:    token,
 		Path:     "/",
 		HttpOnly: true,
@@ -102,7 +110,7 @@ func SetAuthCookie(w http.ResponseWriter, token string) {
 func ClearAuthCookie(w http.ResponseWriter) {
 	secure := os.Getenv("COOKIE_SECURE") != "false"
 	http.SetCookie(w, &http.Cookie{
-		Name:     cookieName,
+		Name:     cookieNameForEnv(),
 		Value:    "",
 		Path:     "/",
 		HttpOnly: true,
@@ -113,11 +121,11 @@ func ClearAuthCookie(w http.ResponseWriter) {
 }
 
 // ExtractTokenFromRequest reads the JWT from (priority order):
-//  1. __Host-platform-token HttpOnly cookie  — browsers
-//  2. Authorization: Bearer <token>           — API clients / CI
-//  3. ?token= query param                     — SSE only (EventSource can't set headers)
+//  1. HttpOnly cookie (platform-token / __Host-platform-token) — browsers
+//  2. Authorization: Bearer <token>                             — API clients / CI
+//  3. ?token= query param                                       — SSE only
 func ExtractTokenFromRequest(r *http.Request) string {
-	if c, err := r.Cookie(cookieName); err == nil && c.Value != "" {
+	if c, err := r.Cookie(cookieNameForEnv()); err == nil && c.Value != "" {
 		return c.Value
 	}
 	if h := r.Header.Get("Authorization"); h != "" {
