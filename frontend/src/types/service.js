@@ -4,4 +4,3 @@ export const ENV_STATUS = {
   NOT_DEPLOYED: "not_deployed",
 }
 
-

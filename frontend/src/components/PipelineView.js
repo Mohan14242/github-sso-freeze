@@ -40,12 +40,6 @@ function formatDuration(startedAt, completedAt) {
   return `${Math.floor(secs / 60)}m ${secs % 60}s`
 }
 
-// ── CHANGE 1: accept stageFilter prop ────────────────────────────
-// stageFilter: optional string[] passed from ServiceDashboard.
-// When provided (rollback): only stages whose stageName is in the
-// list are rendered. The backend already creates only those stages
-// for a rollback run, so this mainly drives the badge + label.
-// When null/undefined (normal deploy): all stages are shown.
 export default function PipelineView({ runId, serviceName, environment, onClose, stageFilter }) {
   const [run,         setRun]         = useState(null)
   const [loading,     setLoading]     = useState(true)
@@ -53,7 +47,10 @@ export default function PipelineView({ runId, serviceName, environment, onClose,
   const [expandedLog, setExpandedLog] = useState(null)
   const cleanupRef                    = useRef(null)
   const timerRef                      = useRef(null)
+  // Track if this effect instance is still active (prevents stale async callbacks)
+  const mountedRef                    = useRef(true)
 
+  // 1-second tick to keep duration timers updating while a stage is running
   useEffect(() => {
     timerRef.current = setInterval(() => {
       setRun(prev => prev ? { ...prev, _tick: Date.now() } : prev)
@@ -63,17 +60,30 @@ export default function PipelineView({ runId, serviceName, environment, onClose,
 
   useEffect(() => {
     if (!runId) return
+
+    mountedRef.current = true
     setSseStatus("connecting")
     setLoading(true)
 
-    const cleanup = streamPipelineRun(runId, {
+    // ── KEY FIX ──────────────────────────────────────────────────────────────
+    // streamPipelineRun is now async because it first fetches /auth/sse-token
+    // to get the JWT as a readable string, then passes it as ?token= in the
+    // SSE URL. EventSource cannot set headers, and HttpOnly cookies are not
+    // sent cross-origin (React dev :5173 → backend :8080), so we need the
+    // token in the URL for the stream to authenticate correctly.
+    // ─────────────────────────────────────────────────────────────────────────
+    let didCleanup = false
+
+    streamPipelineRun(runId, {
       onSnapshot: (event) => {
+        if (!mountedRef.current) return
         const data = event.payload ?? event
         setRun(data)
         setLoading(false)
         setSseStatus("live")
       },
       onStageUpdated: (event) => {
+        if (!mountedRef.current) return
         const stage = event.payload ?? event
         setRun(prev => {
           if (!prev) return prev
@@ -86,33 +96,59 @@ export default function PipelineView({ runId, serviceName, environment, onClose,
         })
       },
       onRunUpdated: (event) => {
+        if (!mountedRef.current) return
         const data = event.payload ?? event
         setRun(prev => prev ? { ...prev, status: data.status, completedAt: data.completedAt } : prev)
       },
       onCompleted: (event) => {
+        if (!mountedRef.current) return
         const data = event.payload ?? event
         setRun(prev => prev ? { ...prev, status: data.status, completedAt: data.completedAt } : prev)
         setSseStatus("completed")
         clearInterval(timerRef.current)
       },
       onError: () => {
+        if (!mountedRef.current) return
         setSseStatus("error")
         setLoading(false)
+        // SSE failed — fall back to a one-shot REST fetch so the user
+        // at least sees the last known state
         fetchPipelineRun(runId)
-          .then(data => { setRun(data); setLoading(false) })
+          .then(data => {
+            if (mountedRef.current) { setRun(data); setLoading(false) }
+          })
           .catch(() => {})
       },
+    }).then(cleanup => {
+      // streamPipelineRun resolves with the cleanup function once the
+      // EventSource is set up
+      if (didCleanup) {
+        // component unmounted before the promise resolved — clean up immediately
+        cleanup?.()
+      } else {
+        cleanupRef.current = cleanup
+      }
+    }).catch(err => {
+      // Failed to even set up the SSE (e.g. /auth/sse-token request failed)
+      console.error("[PipelineView] SSE setup failed:", err)
+      if (!mountedRef.current) return
+      setSseStatus("error")
+      setLoading(false)
+      fetchPipelineRun(runId)
+        .then(data => { if (mountedRef.current) { setRun(data); setLoading(false) } })
+        .catch(() => {})
     })
 
-    cleanupRef.current = cleanup
-    return () => { cleanup(); clearInterval(timerRef.current) }
+    return () => {
+      mountedRef.current = false
+      didCleanup = true
+      cleanupRef.current?.()
+      cleanupRef.current = null
+      clearInterval(timerRef.current)
+    }
   }, [runId])
 
-  // ── CHANGE 2: compute visibleStages ──────────────────────────
-  // When stageFilter is provided, only show matching stages.
-  // For rollback runs the backend only creates 2 stages anyway
-  // ("Rollback" and "Health Check"), so this is mostly for safety
-  // and to drive the "Rollback view" badge in the header.
+  // Visible stages — respect stageFilter for rollback views
   const visibleStages = run?.stages
     ? (stageFilter?.length
         ? run.stages.filter(s => stageFilter.includes(s.stageName))
@@ -120,7 +156,6 @@ export default function PipelineView({ runId, serviceName, environment, onClose,
     : []
 
   const runCfg       = run ? (RUN_STATUS_CFG[run.status] ?? RUN_STATUS_CFG.pending) : null
-  // ── CHANGE 3: use visibleStages for progress counts ──────────
   const successCount = visibleStages.filter(s => s.status === "success").length
   const totalCount   = visibleStages.length
   const progressPct  = totalCount > 0 ? (successCount / totalCount) * 100 : 0
@@ -153,6 +188,8 @@ export default function PipelineView({ runId, serviceName, environment, onClose,
             display: "flex", alignItems: "center", gap: 8,
           }}>
             Pipeline Run #{runId}
+
+            {/* SSE status badge */}
             <span style={{
               display: "flex", alignItems: "center", gap: 4,
               padding: "2px 7px", borderRadius: 10,
@@ -180,7 +217,7 @@ export default function PipelineView({ runId, serviceName, environment, onClose,
               : "CONNECTING"}
             </span>
 
-            {/* ── CHANGE 4: rollback view badge in header ── */}
+            {/* Rollback badge */}
             {stageFilter?.length > 0 && (
               <span style={{
                 display: "flex", alignItems: "center", gap: 4,
@@ -256,11 +293,10 @@ export default function PipelineView({ runId, serviceName, environment, onClose,
 
         {!loading && run && (
           <>
-            {/* Progress bar — uses visibleStages counts */}
+            {/* Progress bar */}
             <div style={{ marginBottom: 24 }}>
               <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6, alignItems: "center" }}>
                 <span style={{ fontSize: 10, color: "#334155", fontWeight: 700, letterSpacing: "0.1em", textTransform: "uppercase" }}>
-                  {/* ── CHANGE 5: label differs for rollback view ── */}
                   {stageFilter?.length ? "Rollback progress" : "Progress"}
                 </span>
                 <span style={{ fontSize: 11, color: "#475569", fontFamily: "monospace" }}>
@@ -279,7 +315,7 @@ export default function PipelineView({ runId, serviceName, environment, onClose,
               </div>
             </div>
 
-            {/* ── CHANGE 6: info strip shown only in rollback view ── */}
+            {/* Rollback info strip */}
             {stageFilter?.length > 0 && (
               <div style={{
                 marginBottom: 16, padding: "8px 12px",
@@ -288,19 +324,16 @@ export default function PipelineView({ runId, serviceName, environment, onClose,
                 fontSize: 11, color: "#6366f1",
               }}>
                 <span>↩️</span>
-                <span>
-                  Rollback pipeline — showing: {stageFilter.join(", ")}
-                </span>
+                <span>Rollback pipeline — showing: {stageFilter.join(", ")}</span>
               </div>
             )}
 
-            {/* Stage timeline — uses visibleStages */}
+            {/* Stage timeline */}
             <div style={{ display: "flex", flexDirection: "column", gap: 0 }}>
-              {/* ── CHANGE 7: render visibleStages instead of run.stages ── */}
               {visibleStages.map((stage, idx) => {
-                const cfg         = STATUS_CFG[stage.status] ?? STATUS_CFG.pending
-                const isExpanded  = expandedLog === stage.id
-                const hasLogs     = !!stage.logs
+                const cfg        = STATUS_CFG[stage.status] ?? STATUS_CFG.pending
+                const isExpanded = expandedLog === stage.id
+                const hasLogs    = !!stage.logs
                 const prevSuccess = idx > 0 && visibleStages[idx - 1].status === "success"
 
                 return (
@@ -408,7 +441,6 @@ export default function PipelineView({ runId, serviceName, environment, onClose,
                 <span style={{ fontSize: 28 }}>{run.status === "success" ? "🎉" : "💥"}</span>
                 <div>
                   <div style={{ fontWeight: 700, fontSize: 14, color: run.status === "success" ? "#10b981" : "#e74c3c" }}>
-                    {/* ── CHANGE 8: different success message for rollback ── */}
                     {run.status === "success"
                       ? stageFilter?.length
                         ? "Rollback completed successfully"
