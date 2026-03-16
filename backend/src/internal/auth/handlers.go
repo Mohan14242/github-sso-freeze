@@ -437,3 +437,23 @@ func redirectError(w http.ResponseWriter, r *http.Request, reason string) {
 	frontendURL := strings.TrimRight(os.Getenv("FRONTEND_URL"), "/")
 	http.Redirect(w, r, frontendURL+"/login?error="+reason, http.StatusTemporaryRedirect)
 }
+
+func HandleSSEToken(w http.ResponseWriter, r *http.Request) {
+	token := ExtractTokenFromRequest(r)
+	if token == "" {
+		http.Error(w, `{"error":"no token"}`, http.StatusUnauthorized)
+		return
+	}
+
+	claims := ClaimsFromContext(r.Context())
+	if claims == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"token":     token,
+		"expiresAt": claims.ExpiresAt.Time.Unix(),
+	})
+}

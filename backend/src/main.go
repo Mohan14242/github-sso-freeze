@@ -211,6 +211,7 @@ func main() {
 
 	// Service creation requests — operator approves/rejects
 	api.HandleFunc("/service-creation-requests", auth.RequireRole("operator", handler.GetServiceCreationRequests))
+	api.HandleFunc("/auth/sse-token", auth.Authenticate(auth.HandleSSEToken))
 	api.HandleFunc("/service-creation-requests/", auth.RequireRole("operator", func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/approve"):
