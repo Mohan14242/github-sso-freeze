@@ -187,17 +187,16 @@ func main() {
 
 	// Pipeline — SSE uses its own rate limiter; stage updates use pipeline key
 	api.HandleFunc("/pipeline/service/", auth.RequireRole("readonly", handler.GetLatestPipelineRun))
-	api.HandleFunc("/pipeline/", func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case strings.HasSuffix(r.URL.Path, "/stream"):
-			mw.RateLimit(mw.PipelineLimiter)(
-				http.HandlerFunc(auth.RequireRole("readonly", handler.StreamPipelineRun)),
-			).ServeHTTP(w, r)
-		case strings.HasSuffix(r.URL.Path, "/stage"):
-			auth.RequirePipelineKey(handler.UpdatePipelineStage)(w, r)
-		default:
-			auth.RequireRole("readonly", handler.GetPipelineRun)(w, r)
+	mux.HandleFunc("/pipeline/", func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/stream") {
+			auth.RequireRole("readonly", handler.StreamPipelineRun)(w, r)
+			return
 		}
+		if strings.HasSuffix(r.URL.Path, "/stage") {
+			auth.RequirePipelineKey(handler.UpdatePipelineStage)(w, r)
+			return
+		}
+		auth.RequireRole("readonly", handler.GetPipelineRun)(w, r)
 	})
 
 	// Artifacts — pipeline key for write
