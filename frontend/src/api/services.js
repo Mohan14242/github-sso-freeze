@@ -35,12 +35,8 @@ export async function deployService(serviceName, environment) {
   return data
 }
 
-
-
 export async function fetchPlatformStats() {
   const res = await apiFetch("/api/stats")
   if (!res || !res.ok) throw new Error("Failed to fetch stats")
   return res.json()
 }
-
-

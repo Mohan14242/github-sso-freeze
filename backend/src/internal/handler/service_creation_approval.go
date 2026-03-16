@@ -117,12 +117,13 @@ func ApproveServiceCreation(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[SCR][APPROVE] id=%d reviewedBy=%s", id, reviewedBy)
 
 	// Fetch the pending request
-	var yamlPayload, serviceName string
+	// AFTER
+	var yamlPayload, serviceName, requestedBy string
 	err = db.DB.QueryRow(`
-		SELECT yaml_payload, service_name
+		SELECT yaml_payload, service_name, requested_by
 		FROM service_creation_requests
 		WHERE id = ? AND status = 'pending'
-	`, id).Scan(&yamlPayload, &serviceName)
+	`, id).Scan(&yamlPayload, &serviceName, &requestedBy)
 
 	if err == sql.ErrNoRows {
 		// ── audit: not found ──
@@ -145,6 +146,7 @@ func ApproveServiceCreation(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[SCR][APPROVE] Found request service=%s, triggering creation", serviceName)
 
 	// Parse YAML
+	// AFTER
 	var req model.CreateServiceRequest
 	if err := yaml.Unmarshal([]byte(yamlPayload), &req); err != nil {
 		log.Printf("[SCR][APPROVE][ERROR] Failed to parse stored YAML: %v", err)
@@ -161,6 +163,8 @@ func ApproveServiceCreation(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "stored yaml is invalid", http.StatusInternalServerError)
 		return
 	}
+
+	req.OwnerTeam = requestedBy
 
 	// Mark as approved BEFORE creating
 	_, err = db.DB.Exec(`

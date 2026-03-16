@@ -6,7 +6,6 @@ export async function fetchProdApprovals() {
   return res.json()
 }
 
-
 export async function fetchApprovalById(approvalId) {
   const res = await apiFetch(`/api/approvals/${approvalId}`)
   if (!res?.ok) throw new Error("Failed to fetch approval")
@@ -14,9 +13,7 @@ export async function fetchApprovalById(approvalId) {
 }
 
 export async function approveDeployment(id) {
-  const res = await apiFetch(`/api/approvals/${id}/approve`, {
-    method: "POST",
-  })
+  const res = await apiFetch(`/api/approvals/${id}/approve`, { method: "POST" })
   if (!res?.ok) throw new Error("Failed to approve deployment")
   return res.json()
 }

@@ -5,12 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
 	"strings"
 	"time"
+	"log"
 )
 
 type JenkinsClient struct {
@@ -19,9 +20,10 @@ type JenkinsClient struct {
 	Token   string
 }
 
-// ─────────────────────────────────────────────
-// Create Jenkins client with normalized base URL
-// ─────────────────────────────────────────────
+// NewJenkinsClient creates a client from environment variables.
+// Returns an error instead of calling log.Fatal so the caller can handle it gracefully.
+
+
 
 func NewJenkinsClient() *JenkinsClient {
 	baseURL := os.Getenv("JENKINS_URL")
@@ -46,35 +48,31 @@ func NewJenkinsClient() *JenkinsClient {
 	return client
 }
 
-// ─────────────────────────────────────────────
-// CSRF CRUMB (method on JenkinsClient)
-// ─────────────────────────────────────────────
+
+
+// jenkinsHTTPClient has a 15-second timeout.
+var jenkinsHTTPClient = &http.Client{Timeout: 15 * time.Second}
+
+/* ── CSRF crumb (method on JenkinsClient) ── */
 
 func (j *JenkinsClient) getCrumb() (string, string, error) {
 	crumbURL := j.BaseURL + "/crumbIssuer/api/json"
-	log.Println("[JENKINS] Fetching CSRF crumb from:", crumbURL)
 
 	req, err := http.NewRequest("GET", crumbURL, nil)
 	if err != nil {
-		log.Println("[JENKINS][ERROR] Failed to create crumb request:", err)
-		return "", "", err
+		return "", "", fmt.Errorf("build crumb request: %w", err)
 	}
 	req.SetBasicAuth(j.User, j.Token)
 
-	start    := time.Now()
-	resp, err := http.DefaultClient.Do(req)
-	log.Println("[JENKINS] Crumb request latency:", time.Since(start))
-
+	resp, err := jenkinsHTTPClient.Do(req)
 	if err != nil {
-		log.Println("[JENKINS][ERROR] Crumb request failed:", err)
-		return "", "", err
+		return "", "", fmt.Errorf("crumb request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
-	log.Println("[JENKINS] Crumb response status:", resp.Status)
-
 	if resp.StatusCode >= 300 {
-		return "", "", fmt.Errorf("crumb fetch failed: %s", resp.Status)
+		body, _ := io.ReadAll(resp.Body)
+		return "", "", fmt.Errorf("crumb fetch failed: %s — %s", resp.Status, string(body))
 	}
 
 	var data struct {
@@ -82,21 +80,15 @@ func (j *JenkinsClient) getCrumb() (string, string, error) {
 		CrumbRequestField string `json:"crumbRequestField"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-		log.Println("[JENKINS][ERROR] Failed to decode crumb response:", err)
-		return "", "", err
+		return "", "", fmt.Errorf("decode crumb: %w", err)
 	}
-
-	log.Println("[JENKINS] Crumb field:", data.CrumbRequestField)
 	return data.CrumbRequestField, data.Crumb, nil
 }
 
-// ─────────────────────────────────────────────
-// getCrumb as standalone helper (used by Trigger functions)
-// ─────────────────────────────────────────────
+/* ── Standalone getCrumb for Trigger functions ── */
 
 func getCrumb(client *http.Client, jenkinsURL, user, apiToken string) (string, string, error) {
 	crumbURL := fmt.Sprintf("%s/crumbIssuer/api/json", jenkinsURL)
-
 	req, err := http.NewRequest("GET", crumbURL, nil)
 	if err != nil {
 		return "", "", err
@@ -111,7 +103,7 @@ func getCrumb(client *http.Client, jenkinsURL, user, apiToken string) (string, s
 
 	if resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(resp.Body)
-		return "", "", fmt.Errorf("crumb fetch failed: %s - %s", resp.Status, string(body))
+		return "", "", fmt.Errorf("crumb fetch failed: %s — %s", resp.Status, string(body))
 	}
 
 	var data struct {
@@ -121,35 +113,27 @@ func getCrumb(client *http.Client, jenkinsURL, user, apiToken string) (string, s
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
 		return "", "", err
 	}
-
 	return data.CrumbRequestField, data.Crumb, nil
 }
 
-// ─────────────────────────────────────────────
-// CREATE MULTIBRANCH JOB
-// ─────────────────────────────────────────────
+/* ── CreateMultibranchJob ── */
 
-func (j *JenkinsClient) CreateMultibranchJob(
-	jobName, repoURL, credentialsID, webhookToken string,
-) error {
-	log.Println("[JENKINS] Creating multibranch job:", jobName)
+func (j *JenkinsClient) CreateMultibranchJob(jobName, repoURL, credentialsID, webhookToken string) error {
+	slog.Info("creating Jenkins multibranch job", "job", jobName)
 
 	configXML := fmt.Sprintf(`
 <org.jenkinsci.plugins.workflow.multibranch.WorkflowMultiBranchProject plugin="workflow-multibranch">
   <description>Auto-created by Platform</description>
-
   <properties>
     <com.igalg.jenkins.plugins.mswt.trigger.ComputedFolderWebHookTrigger>
       <token>%s</token>
     </com.igalg.jenkins.plugins.mswt.trigger.ComputedFolderWebHookTrigger>
   </properties>
-
   <orphanedItemStrategy class="com.cloudbees.hudson.plugins.folder.computed.DefaultOrphanedItemStrategy">
     <pruneDeadBranches>true</pruneDeadBranches>
     <daysToKeep>-1</daysToKeep>
     <numToKeep>-1</numToKeep>
   </orphanedItemStrategy>
-
   <sources class="jenkins.branch.MultiBranchProject$BranchSourceList">
     <data>
       <jenkins.branch.BranchSource>
@@ -162,45 +146,40 @@ func (j *JenkinsClient) CreateMultibranchJob(
       </jenkins.branch.BranchSource>
     </data>
   </sources>
-
   <factory class="org.jenkinsci.plugins.workflow.multibranch.WorkflowBranchProjectFactory">
     <scriptPath>Jenkinsfile</scriptPath>
   </factory>
 </org.jenkinsci.plugins.workflow.multibranch.WorkflowMultiBranchProject>
 `,
-		webhookToken,
-		jobName,
-		extractOwner(repoURL),
-		extractRepo(repoURL),
+		webhookToken, jobName,
+		extractOwner(repoURL), extractRepo(repoURL),
 		credentialsID,
 	)
 
 	endpoint := fmt.Sprintf("%s/createItem?name=%s", j.BaseURL, url.QueryEscape(jobName))
-
-	req, _ := http.NewRequest("POST", endpoint, bytes.NewBuffer([]byte(configXML)))
+	req, err := http.NewRequest("POST", endpoint, bytes.NewBufferString(configXML))
+	if err != nil {
+		return fmt.Errorf("build request: %w", err)
+	}
 	req.SetBasicAuth(j.User, j.Token)
 	req.Header.Set("Content-Type", "application/xml")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := jenkinsHTTPClient.Do(req)
 	if err != nil {
-		return err
+		return fmt.Errorf("job creation request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("jenkins job creation failed: %s - %s", resp.Status, string(body))
+		return fmt.Errorf("jenkins job creation failed: %s — %s", resp.Status, string(body))
 	}
 
-	log.Println("[JENKINS] Job created:", jobName)
+	slog.Info("Jenkins job created", "job", jobName)
 	return nil
 }
 
-// ─────────────────────────────────────────────
-// TRIGGER DEPLOY
-// runID is passed so Jenkins can send stage
-// updates back to the platform pipeline screen
-// ─────────────────────────────────────────────
+/* ── TriggerJenkinsDeploy ── */
 
 func TriggerJenkinsDeploy(jobName, branch string, runID int64) error {
 	jenkinsURL := strings.TrimRight(os.Getenv("JENKINS_URL"), "/")
@@ -208,38 +187,29 @@ func TriggerJenkinsDeploy(jobName, branch string, runID int64) error {
 	apiToken   := os.Getenv("JENKINS_API_TOKEN")
 
 	if jenkinsURL == "" || user == "" || apiToken == "" {
-		return fmt.Errorf("jenkins environment variables not set")
+		return fmt.Errorf("Jenkins environment variables not set (JENKINS_URL, JENKINS_USER, JENKINS_API_TOKEN)")
 	}
 
-	log.Printf("[JENKINS] TriggerJenkinsDeploy job=%s branch=%s runID=%d", jobName, branch, runID)
+	slog.Info("triggering Jenkins deploy", "job", jobName, "branch", branch, "run_id", runID)
 
-	client := &http.Client{}
+	client := &http.Client{Timeout: 15 * time.Second}
 
-	/* 1️⃣ GET CRUMB */
 	crumbField, crumb, err := getCrumb(client, jenkinsURL, user, apiToken)
 	if err != nil {
-		return fmt.Errorf("failed to get crumb: %w", err)
+		return fmt.Errorf("get CSRF crumb: %w", err)
 	}
 
-	/* 2️⃣ PREPARE PARAMETERS — include RUN_ID */
 	formData := url.Values{}
 	formData.Set("ROLLBACK",         "false")
 	formData.Set("ROLLBACK_VERSION", "")
-	formData.Set("RUN_ID",           fmt.Sprintf("%d", runID)) // ← passed to Jenkinsfile
+	formData.Set("RUN_ID",           fmt.Sprintf("%d", runID))
 
-	/* 3️⃣ BUILD MULTIBRANCH URL */
-	buildURL := fmt.Sprintf(
-		"%s/job/%s/job/%s/buildWithParameters",
-		jenkinsURL,
-		url.PathEscape(jobName),
-		url.PathEscape(branch),
-	)
-	log.Println("[JENKINS] Build URL:", buildURL)
+	buildURL := fmt.Sprintf("%s/job/%s/job/%s/buildWithParameters",
+		jenkinsURL, url.PathEscape(jobName), url.PathEscape(branch))
 
-	/* 4️⃣ TRIGGER BUILD */
 	req, err := http.NewRequest("POST", buildURL, strings.NewReader(formData.Encode()))
 	if err != nil {
-		return err
+		return fmt.Errorf("build request: %w", err)
 	}
 	req.SetBasicAuth(user, apiToken)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -247,25 +217,20 @@ func TriggerJenkinsDeploy(jobName, branch string, runID int64) error {
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return err
+		return fmt.Errorf("Jenkins trigger request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(resp.Body)
-
 	if resp.StatusCode != 201 && resp.StatusCode != 302 {
-		return fmt.Errorf("jenkins trigger failed: %s - %s", resp.Status, string(body))
+		return fmt.Errorf("Jenkins trigger failed: %s — %s", resp.Status, string(body))
 	}
 
-	log.Printf("[JENKINS] Deploy triggered successfully job=%s branch=%s runID=%d", jobName, branch, runID)
+	slog.Info("Jenkins deploy triggered", "job", jobName, "branch", branch, "run_id", runID)
 	return nil
 }
 
-// ─────────────────────────────────────────────
-// TRIGGER ROLLBACK
-// runID is passed so Jenkins can send stage
-// updates back to the platform pipeline screen
-// ─────────────────────────────────────────────
+/* ── TriggerJenkinsRollback ── */
 
 func TriggerJenkinsRollback(serviceName, branch, version string, runID int64) error {
 	jenkinsURL := strings.TrimRight(os.Getenv("JENKINS_URL"), "/")
@@ -273,39 +238,29 @@ func TriggerJenkinsRollback(serviceName, branch, version string, runID int64) er
 	apiToken   := os.Getenv("JENKINS_API_TOKEN")
 
 	if jenkinsURL == "" || user == "" || apiToken == "" {
-		return fmt.Errorf("jenkins environment variables not set")
+		return fmt.Errorf("Jenkins environment variables not set")
 	}
 
-	log.Printf("[JENKINS] TriggerJenkinsRollback service=%s branch=%s version=%s runID=%d",
-		serviceName, branch, version, runID)
+	slog.Info("triggering Jenkins rollback", "service", serviceName, "branch", branch, "version", version, "run_id", runID)
 
-	client := &http.Client{}
+	client := &http.Client{Timeout: 15 * time.Second}
 
-	/* 1️⃣ GET CRUMB */
 	crumbField, crumb, err := getCrumb(client, jenkinsURL, user, apiToken)
 	if err != nil {
-		return fmt.Errorf("failed to get crumb: %w", err)
+		return fmt.Errorf("get CSRF crumb: %w", err)
 	}
 
-	/* 2️⃣ PREPARE PARAMETERS — include RUN_ID */
 	formData := url.Values{}
 	formData.Set("ROLLBACK",         "true")
 	formData.Set("ROLLBACK_VERSION", version)
-	formData.Set("RUN_ID",           fmt.Sprintf("%d", runID)) // ← passed to Jenkinsfile
+	formData.Set("RUN_ID",           fmt.Sprintf("%d", runID))
 
-	/* 3️⃣ BUILD MULTIBRANCH URL */
-	buildURL := fmt.Sprintf(
-		"%s/job/%s/job/%s/buildWithParameters",
-		jenkinsURL,
-		url.PathEscape(serviceName),
-		url.PathEscape(branch),
-	)
-	log.Println("[JENKINS] Rollback URL:", buildURL)
+	buildURL := fmt.Sprintf("%s/job/%s/job/%s/buildWithParameters",
+		jenkinsURL, url.PathEscape(serviceName), url.PathEscape(branch))
 
-	/* 4️⃣ TRIGGER ROLLBACK */
 	req, err := http.NewRequest("POST", buildURL, strings.NewReader(formData.Encode()))
 	if err != nil {
-		return err
+		return fmt.Errorf("build request: %w", err)
 	}
 	req.SetBasicAuth(user, apiToken)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -313,17 +268,15 @@ func TriggerJenkinsRollback(serviceName, branch, version string, runID int64) er
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return err
+		return fmt.Errorf("Jenkins rollback request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(resp.Body)
-
 	if resp.StatusCode != 201 && resp.StatusCode != 302 {
-		return fmt.Errorf("jenkins rollback failed: %s - %s", resp.Status, string(body))
+		return fmt.Errorf("Jenkins rollback failed: %s — %s", resp.Status, string(body))
 	}
 
-	log.Printf("[JENKINS] Rollback triggered successfully service=%s branch=%s version=%s runID=%d",
-		serviceName, branch, version, runID)
+	slog.Info("Jenkins rollback triggered", "service", serviceName, "branch", branch, "version", version, "run_id", runID)
 	return nil
 }

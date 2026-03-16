@@ -43,7 +43,6 @@ func CreateService(w http.ResponseWriter, r *http.Request) {
 
 	if req.ServiceName == "" ||
 		req.RepoName == "" ||
-		req.OwnerTeam == "" ||
 		req.Runtime == "" ||
 		req.TemplateVersion == "" ||
 		req.CICDType == "" ||
@@ -55,11 +54,14 @@ func CreateService(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// AFTER — ownerTeam is set from the authenticated user's login
 	requestedBy := "unknown"
 	claims := auth.ClaimsFromContext(r.Context())
 	if claims != nil {
 		requestedBy = claims.GithubLogin
 	}
+	// Owner is always the submitting user — not taken from YAML
+	req.OwnerTeam = requestedBy
 
 	log.Printf("[CREATE-SERVICE] Request from user=%s service=%s runtime=%s templateVersion=%s",
 		requestedBy, req.ServiceName, req.Runtime, req.TemplateVersion)

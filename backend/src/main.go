@@ -2,29 +2,63 @@ package main
 
 import (
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"src/src/internal/audit"
 	"src/src/internal/auth"
 	"src/src/internal/db"
 	"src/src/internal/handler"
+	"src/src/internal/middleware"
+	mw "src/src/internal/middleware"
 )
 
-// ── seedTemplateVersions auto-registers folders found on disk ───
+/* ── Path extractors ─────────────────────────────────────────── */
+
+func seg(path string, idx int) string {
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if idx < len(parts) {
+		return parts[idx]
+	}
+	return ""
+}
+
+func deployName(path string) string    { return seg(path, 1) } // /deploy-services/{name}/...
+func rollbackName(path string) string  { return seg(path, 1) } // /rollback-services/{name}/...
+func dashboardName(path string) string { return seg(path, 1) } // /servicesdashboard/{name}/...
+func freezeName(path string) string    { return seg(path, 1) } // /services/{name}/...
+
+/* ── Health checks ───────────────────────────────────────────── */
+
+func handleHealthz(w http.ResponseWriter, r *http.Request) {
+	if err := db.DB.PingContext(r.Context()); err != nil {
+		slog.Error("health: DB ping failed", "error", err)
+		w.Header().Set("Content-Type", "application/json")
+		http.Error(w, `{"status":"unhealthy","db":"unreachable"}`, http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(`{"status":"ok"}`))
+}
+
+func handleReadyz(w http.ResponseWriter, r *http.Request) { handleHealthz(w, r) }
+
+/* ── Template seed ───────────────────────────────────────────── */
+
 func seedTemplateVersions() {
 	root, err := handler.GetTemplateRoot()
 	if err != nil {
-		log.Printf("[SEED] templateRoot not found, skipping seed: %v", err)
+		slog.Warn("templateRoot not found, skipping seed", "error", err)
 		return
 	}
 
 	runtimeDirs, err := os.ReadDir(root)
 	if err != nil {
-		log.Printf("[SEED] cannot read template_data: %v", err)
+		slog.Error("cannot read template_data", "error", err)
 		return
 	}
 
@@ -43,136 +77,195 @@ func seedTemplateVersions() {
 				continue
 			}
 			version := vd.Name()
-			name := runtime + "-service"
-
 			_, err := db.DB.Exec(`
 				INSERT IGNORE INTO template_versions
 				  (name, version, runtime, description, status, created_by)
 				VALUES (?, ?, ?, ?, 'active', 'system')
-			`, name, version, runtime,
+			`, runtime+"-service", version, runtime,
 				fmt.Sprintf("Auto-seeded %s %s template", runtime, version))
 			if err != nil {
-				log.Printf("[SEED] failed to seed %s/%s: %v", runtime, version, err)
+				slog.Warn("template seed failed", "runtime", runtime, "version", version, "error", err)
 			} else {
 				count++
-				log.Printf("[SEED] ✅ seeded template %s@%s runtime=%s", name, version, runtime)
 			}
 		}
 	}
-	log.Printf("[SEED] template seed complete — %d entries processed", count)
+	slog.Info("template seed complete", "count", count)
 }
 
+/* ── main ────────────────────────────────────────────────────── */
+
 func main() {
+	// 1. Structured JSON middleware
+	middleware.Init()
+	slog.Info("platform backend starting")
+
+	// 2. Database with connection pool
 	db.InitMySQL()
 	if err := db.EnsureSchema(); err != nil {
-		log.Fatal("❌ Database schema initialization failed:", err)
+		slog.Error("schema init failed", "error", err)
+		os.Exit(1)
 	}
 
-	// ✅ Auto-seed template versions from disk
+	// 3. Seed templates
 	seedTemplateVersions()
 
+	// 4. Routes
 	mux := http.NewServeMux()
 
-	// ─────────────────────────────────────────
-	// PUBLIC — no JWT required
-	// ─────────────────────────────────────────
-	mux.HandleFunc("/auth/login", auth.HandleLogin)
-	mux.HandleFunc("/auth/callback", auth.HandleCallback)
+	// ── Health / readiness — no auth, no rate limit ──
+	mux.HandleFunc("/healthz", handleHealthz)
+	mux.HandleFunc("/readyz",  handleReadyz)
 
-	// ─────────────────────────────────────────
-	// AUTHENTICATED — any valid JWT
-	// ─────────────────────────────────────────
-	mux.HandleFunc("/auth/me", auth.Authenticate(auth.HandleMe))
-
-	// ─────────────────────────────────────────
-	// READONLY+ — every logged-in user
-	// ─────────────────────────────────────────
-	mux.HandleFunc("/services", auth.RequireRole("readonly", handler.GetServices))
-	mux.HandleFunc("/servicesdashboard/", auth.RequireRole("readonly", handler.GetServiceDashboard))
-	mux.HandleFunc("/artifact-by-env/", auth.RequireRole("readonly", handler.GetServiceArtifacts))
-	mux.HandleFunc("/service-by-env/", auth.RequireRole("readonly", handler.GetServiceEnvironments))
-
-	// ─────────────────────────────────────────
-	// DEVELOPER+ — developers, operators, admins
-	// ─────────────────────────────────────────
-	mux.HandleFunc("/create-service", auth.RequireRole("developer", handler.CreateService))
-	mux.HandleFunc("/deploy-services/", auth.RequireRole("developer", handler.DeployServices))
-
-	// ─────────────────────────────────────────
-	// OPERATOR+ — sre, admins only
-	// ─────────────────────────────────────────
-	mux.HandleFunc("/rollback-services/", auth.RequireRole("operator", handler.RollbackService))
-	mux.HandleFunc("/approvals", auth.RequireRole("operator", handler.GetApprovals))
-	mux.HandleFunc("/approvals/", auth.RequireRole("operator", func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasSuffix(r.URL.Path, "/approve") {
-			handler.ApproveDeployment(w, r)
-			return
+	// ── Auth endpoints — strict rate limit ──
+	authLimited := mw.RateLimit(mw.AuthLimiter)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/auth/login":
+			auth.HandleLogin(w, r)
+		case "/auth/callback":
+			auth.HandleCallback(w, r)
+		default:
+			http.NotFound(w, r)
 		}
-		if strings.HasSuffix(r.URL.Path, "/reject") {
-			handler.RejectDeployment(w, r)
-			return
-		}
-		http.NotFound(w, r)
 	}))
+	mux.Handle("/auth/login",    authLimited)
+	mux.Handle("/auth/callback", authLimited)
+	mux.HandleFunc("/auth/logout", auth.HandleLogout)
+	mux.HandleFunc("/auth/me",    auth.Authenticate(auth.HandleMe))
 
-	// ─────────────────────────────────────────
-	// PIPELINE KEY — CI/CD callbacks only
-	// ─────────────────────────────────────────
-	mux.HandleFunc("/artifacts", auth.RequirePipelineKey(handler.RegisterArtifact))
-	mux.HandleFunc("/stats", auth.RequireRole("readonly", handler.GetPlatformStats))
-	mux.HandleFunc("/audit-logs", auth.RequireRole("operator", audit.GetAuditLogs))
+	// ── All API routes — standard rate limit + middleware + CORS ──
+	api := http.NewServeMux()
 
-	// ── Service Creation Requests ──
-	mux.HandleFunc("/service-creation-requests", auth.RequireRole("operator", handler.GetServiceCreationRequests))
-	mux.HandleFunc("/service-creation-requests/", auth.RequireRole("operator", func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasSuffix(r.URL.Path, "/approve") {
-			handler.ApproveServiceCreation(w, r)
-			return
+	// Services list — readonly+
+	api.HandleFunc("/services", auth.RequireRole("readonly", handler.GetServices))
+
+	// Service dashboard — scoped per service
+	api.HandleFunc("/servicesdashboard/", auth.RequireServiceAccess(dashboardName, handler.GetServiceDashboard))
+
+	// Artifacts and environments — readonly
+	api.HandleFunc("/artifact-by-env/", auth.RequireRole("readonly", handler.GetServiceArtifacts))
+	api.HandleFunc("/service-by-env/",  auth.RequireRole("readonly", handler.GetServiceEnvironments))
+
+	// Freeze / unfreeze — split by method inside handler
+	api.HandleFunc("/services/", func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		switch {
+		case strings.HasSuffix(path, "/freeze-status") && r.Method == http.MethodGet:
+			auth.RequireRole("readonly", handler.GetFreezeStatus)(w, r)
+		case strings.HasSuffix(path, "/freeze") && r.Method == http.MethodPost:
+			auth.RequireRole("operator", handler.FreezeDeployment)(w, r)
+		case strings.HasSuffix(path, "/unfreeze") && r.Method == http.MethodPost:
+			auth.RequireRole("operator", handler.UnfreezeDeployment)(w, r)
+		default:
+			http.NotFound(w, r)
 		}
-		if strings.HasSuffix(r.URL.Path, "/reject") {
-			handler.RejectServiceCreation(w, r)
-			return
-		}
-		http.NotFound(w, r)
-	}))
-
-	// ── Template Versions ──
-	mux.HandleFunc("/template-versions/scan", func(w http.ResponseWriter, r *http.Request) {
-		auth.RequireRole("admin", handler.ScanTemplateVersions)(w, r)
 	})
-	mux.HandleFunc("/template-versions", func(w http.ResponseWriter, r *http.Request) {
+
+	// Create service — developer+ (goes to approval queue)
+	api.HandleFunc("/create-service", auth.RequireRole("developer", handler.CreateService))
+
+	// Deploy — service-scoped (developer must be in team)
+	api.HandleFunc("/deploy-services/", auth.RequireServiceAccess(deployName, handler.DeployServices))
+
+	// Rollback — service-scoped
+	api.HandleFunc("/rollback-services/", auth.RequireServiceAccess(rollbackName, handler.RollbackService))
+
+	// Approvals — operator+
+	api.HandleFunc("/approvals", auth.RequireRole("operator", handler.GetApprovals))
+	api.HandleFunc("/approvals/", auth.RequireRole("operator", func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/approve"):
+			handler.ApproveDeployment(w, r)
+		case strings.HasSuffix(r.URL.Path, "/reject"):
+			handler.RejectDeployment(w, r)
+		case r.Method == http.MethodGet:
+			handler.GetApprovalByID(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+
+	// Pipeline — SSE uses its own rate limiter; stage updates use pipeline key
+	api.HandleFunc("/pipeline/service/", auth.RequireRole("readonly", handler.GetLatestPipelineRun))
+	api.HandleFunc("/pipeline/", func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/stream"):
+			mw.RateLimit(mw.PipelineLimiter)(
+				http.HandlerFunc(auth.RequireRole("readonly", handler.StreamPipelineRun)),
+			).ServeHTTP(w, r)
+		case strings.HasSuffix(r.URL.Path, "/stage"):
+			auth.RequirePipelineKey(handler.UpdatePipelineStage)(w, r)
+		default:
+			auth.RequireRole("readonly", handler.GetPipelineRun)(w, r)
+		}
+	})
+
+	// Artifacts — pipeline key for write
+	api.HandleFunc("/artifacts", auth.RequirePipelineKey(handler.RegisterArtifact))
+
+	// Stats — readonly
+	api.HandleFunc("/stats", auth.RequireRole("readonly", handler.GetPlatformStats))
+
+	// Audit logs — operator+
+	api.HandleFunc("/audit-logs", auth.RequireRole("operator", audit.GetAuditLogs))
+
+	// Service creation requests — operator approves/rejects
+	api.HandleFunc("/service-creation-requests", auth.RequireRole("operator", handler.GetServiceCreationRequests))
+	api.HandleFunc("/service-creation-requests/", auth.RequireRole("operator", func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/approve"):
+			handler.ApproveServiceCreation(w, r)
+		case strings.HasSuffix(r.URL.Path, "/reject"):
+			handler.RejectServiceCreation(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+
+	// Template versions — admin manages, readonly views
+	api.HandleFunc("/template-versions/scan", auth.RequireRole("admin", handler.ScanTemplateVersions))
+	api.HandleFunc("/template-versions", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
 			auth.RequireRole("admin", handler.CreateTemplateVersion)(w, r)
 			return
 		}
 		auth.RequireRole("readonly", handler.GetTemplateVersions)(w, r)
 	})
-	mux.HandleFunc("/template-versions/", auth.RequireRole("admin", func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasSuffix(r.URL.Path, "/deprecate") {
+	api.HandleFunc("/template-versions/", auth.RequireRole("admin", func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/deprecate"):
 			handler.DeprecateTemplateVersion(w, r)
-			return
-		}
-		if strings.HasSuffix(r.URL.Path, "/release") {
+		case strings.HasSuffix(r.URL.Path, "/release"):
 			handler.ReleaseTemplateVersion(w, r)
-			return
+		default:
+			http.NotFound(w, r)
 		}
-		http.NotFound(w, r)
 	}))
-	// Pipeline routes — order matters: specific before wildcard
-	mux.HandleFunc("/pipeline/service/", auth.RequireRole("readonly", handler.GetLatestPipelineRun))
 
-	mux.HandleFunc("/pipeline/", func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasSuffix(r.URL.Path, "/stream") {
-			auth.RequireRole("readonly", handler.StreamPipelineRun)(w, r)
-			return
-		}
-		if strings.HasSuffix(r.URL.Path, "/stage") {
-			auth.RequirePipelineKey(handler.UpdatePipelineStage)(w, r)
-			return
-		}
-		auth.RequireRole("readonly", handler.GetPipelineRun)(w, r)
-	})
+	// Wrap all API routes: rate limit → request ID / logging → CORS
+	mux.Handle("/", mw.RateLimit(mw.APILimiter)(
+		middleware.Middleware(
+			auth.WithCORS(api),
+		),
+	))
 
-	log.Println("🚀 Server started on :8080")
-	log.Fatal(http.ListenAndServe(":8080", auth.WithCORS(mux)))
+	// 5. Server with timeouts
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	srv := &http.Server{
+		Addr:         ":" + port,
+		Handler:      mux,
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 60 * time.Second, // generous for SSE long-polling
+		IdleTimeout:  120 * time.Second,
+	}
+
+	slog.Info("server listening", "port", port)
+	if err := srv.ListenAndServe(); err != nil {
+		slog.Error("server exited", "error", err)
+		os.Exit(1)
+	}
 }

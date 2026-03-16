@@ -24,7 +24,7 @@ export async function fetchServiceEnvironments(serviceName) {
   return res.json()
 }
 
-export const createService = async (payload) => {
+export async function createService(payload) {
   const res = await apiFetch("/api/create-service", {
     method: "POST",
     headers: { "Content-Type": "application/json" },

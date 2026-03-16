@@ -2,43 +2,65 @@ import { createContext, useContext, useState, useCallback, useEffect } from "rea
 
 const AuthContext = createContext(null)
 
+const ROLE_PRIORITY = { admin: 4, operator: 3, developer: 2, readonly: 1 }
+
 export function AuthProvider({ children }) {
-  const [user, setUser] = useState(null)
+  const [user,    setUser]    = useState(null)
   const [loading, setLoading] = useState(true)
 
-  // Rehydrate from sessionStorage on page load
+  // JWT lives in an HttpOnly cookie — JS cannot read it.
+  // Hydrate identity on mount by calling /auth/me (cookie sent automatically).
   useEffect(() => {
-    const token = sessionStorage.getItem("jwt_token")
-    const role  = sessionStorage.getItem("user_role")
-    const login = sessionStorage.getItem("user_login")
-
-    if (token && role && login) {
-      setUser({ token, role, login })
-    }
-    setLoading(false)
+    fetch("/api/auth/me", { credentials: "include" })
+      .then(r => r.ok ? r.json() : null)
+      .then(data => {
+        if (data) setUser({ login: data.login, role: data.role, teams: data.teams ?? [] })
+      })
+      .catch(err => console.warn("[auth] /auth/me failed:", err))
+      .finally(() => setLoading(false))
   }, [])
 
-  const login = useCallback((token, role, login) => {
-    sessionStorage.setItem("jwt_token",  token)
-    sessionStorage.setItem("user_role",  role)
-    sessionStorage.setItem("user_login", login)
-    setUser({ token, role, login })
+  // Called by AuthCallback after OAuth redirect — cookie already set, just re-hydrate.
+  const login = useCallback(async () => {
+    const res = await fetch("/api/auth/me", { credentials: "include" })
+    if (!res.ok) return false
+    const data = await res.json()
+    setUser({ login: data.login, role: data.role, teams: data.teams ?? [] })
+    return true
   }, [])
 
-  const logout = useCallback(() => {
-    sessionStorage.clear()
+  // Clears the HttpOnly cookie server-side.
+  const logout = useCallback(async () => {
+    try { await fetch("/api/auth/logout", { method: "POST", credentials: "include" }) } catch {}
     setUser(null)
+    window.location.href = "/login"
   }, [])
 
-  // Returns true if the current user meets or exceeds the required role
   const hasRole = useCallback((minRole) => {
-    const priority = { admin: 4, operator: 3, developer: 2, readonly: 1 }
     if (!user) return false
-    return (priority[user.role] ?? 0) >= (priority[minRole] ?? 0)
+    return (ROLE_PRIORITY[user.role] ?? 0) >= (ROLE_PRIORITY[minRole] ?? 0)
+  }, [user])
+
+  /**
+   * canActOnService(serviceName) — can user deploy/rollback/freeze this service?
+   *   admin / operator → always true (platform-wide)
+   *   developer        → true only if serviceName is in their teams list
+   *   readonly         → always false
+   */
+  const canActOnService = useCallback((serviceName) => {
+    if (!user) return false
+    if (user.role === "admin" || user.role === "operator") return true
+    if (user.role === "readonly") return false
+    const lower = (serviceName || "").toLowerCase()
+    return (user.teams || []).some(t => t.toLowerCase() === lower)
   }, [user])
 
   return (
-    <AuthContext.Provider value={{ user, loading, login, logout, hasRole }}>
+    <AuthContext.Provider value={{
+      user, loading, login, logout, hasRole, canActOnService,
+      isReadOnly:     user?.role === "readonly",
+      isPlatformWide: user?.role === "admin" || user?.role === "operator",
+    }}>
       {children}
     </AuthContext.Provider>
   )

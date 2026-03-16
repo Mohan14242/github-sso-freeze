@@ -2,37 +2,46 @@ package auth
 
 import (
 	"errors"
-	"log"
+	"log/slog"
+	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 )
 
-const tokenDuration = 8 * time.Hour
+const (
+	tokenDuration = 8 * time.Hour
+	// __Host- prefix enforces: Secure=true, Path=/, no Domain — prevents subdomain theft
+	cookieName = "__Host-platform-token"
+)
 
 type Claims struct {
-	GithubLogin string `json:"github_login"`
-	GithubID    int64  `json:"github_id"`
-	Role        string `json:"role"`
+	GithubLogin string   `json:"github_login"`
+	GithubID    int64    `json:"github_id"`
+	Role        string   `json:"role"`
+	Teams       []string `json:"teams"` // all team slugs user belongs to in the org
 	jwt.RegisteredClaims
 }
 
-func GenerateJWT(login string, githubID int64, role string) (string, error) {
-	log.Printf("[JWT][GENERATE] Generating token → login=%s githubID=%d role=%s", login, githubID, role)
+func GenerateJWT(login string, githubID int64, role string, teams []string) (string, error) {
+	slog.Info("generating JWT", "login", login, "role", role, "team_count", len(teams))
 
 	secret := []byte(os.Getenv("JWT_SECRET"))
 	if len(secret) == 0 {
-		log.Println("[JWT][GENERATE][ERROR] JWT_SECRET env var is empty — cannot sign token")
 		return "", errors.New("JWT_SECRET is not set")
+	}
+	if teams == nil {
+		teams = []string{}
 	}
 
 	expiresAt := time.Now().Add(tokenDuration)
-
 	claims := Claims{
 		GithubLogin: login,
 		GithubID:    githubID,
 		Role:        role,
+		Teams:       teams,
 		RegisteredClaims: jwt.RegisteredClaims{
 			Subject:   login,
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
@@ -41,54 +50,90 @@ func GenerateJWT(login string, githubID int64, role string) (string, error) {
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-
 	signed, err := token.SignedString(secret)
 	if err != nil {
-		log.Printf("[JWT][GENERATE][ERROR] Failed to sign token for login=%s: %v", login, err)
+		slog.Error("JWT sign failed", "login", login, "error", err)
 		return "", err
 	}
 
-	log.Printf("[JWT][GENERATE][SUCCESS] Token issued → login=%s role=%s expiresAt=%s",
-		login, role, expiresAt.Format(time.RFC3339))
+	slog.Info("JWT issued", "login", login, "role", role, "expires_at", expiresAt.Format(time.RFC3339))
 	return signed, nil
 }
 
 func ValidateJWT(tokenStr string) (*Claims, error) {
-	log.Println("[JWT][VALIDATE] Validating incoming JWT")
-
 	secret := []byte(os.Getenv("JWT_SECRET"))
 	if len(secret) == 0 {
-		log.Println("[JWT][VALIDATE][ERROR] JWT_SECRET env var is empty — cannot validate token")
 		return nil, errors.New("JWT_SECRET is not set")
 	}
 
-	token, err := jwt.ParseWithClaims(
-		tokenStr,
-		&Claims{},
-		func(t *jwt.Token) (interface{}, error) {
-			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
-				algo := t.Header["alg"]
-				log.Printf("[JWT][VALIDATE][ERROR] Unexpected signing algorithm: %v", algo)
-				return nil, errors.New("unexpected signing method")
-			}
-			return secret, nil
-		},
-	)
-
+	token, err := jwt.ParseWithClaims(tokenStr, &Claims{}, func(t *jwt.Token) (interface{}, error) {
+		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, errors.New("unexpected signing method")
+		}
+		return secret, nil
+	})
 	if err != nil {
-		log.Printf("[JWT][VALIDATE][ERROR] Token parse/validation failed: %v", err)
 		return nil, err
 	}
 
 	claims, ok := token.Claims.(*Claims)
 	if !ok || !token.Valid {
-		log.Println("[JWT][VALIDATE][ERROR] Token claims invalid or token marked invalid")
 		return nil, errors.New("invalid token")
 	}
-
-	remaining := time.Until(claims.ExpiresAt.Time).Round(time.Minute)
-	log.Printf("[JWT][VALIDATE][SUCCESS] Token valid → login=%s role=%s expiresIn=%s",
-		claims.GithubLogin, claims.Role, remaining)
-
 	return claims, nil
+}
+
+// SetAuthCookie writes the JWT as an HttpOnly Secure SameSite=Lax cookie.
+// Set COOKIE_SECURE=false in local dev (HTTP only).
+func SetAuthCookie(w http.ResponseWriter, token string) {
+	secure := os.Getenv("COOKIE_SECURE") != "false"
+	http.SetCookie(w, &http.Cookie{
+		Name:     cookieName,
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   secure,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   int(tokenDuration.Seconds()),
+	})
+}
+
+// ClearAuthCookie expires the auth cookie immediately.
+func ClearAuthCookie(w http.ResponseWriter) {
+	secure := os.Getenv("COOKIE_SECURE") != "false"
+	http.SetCookie(w, &http.Cookie{
+		Name:     cookieName,
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   secure,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   -1,
+	})
+}
+
+// ExtractTokenFromRequest reads the JWT from (priority order):
+//  1. __Host-platform-token HttpOnly cookie  — browsers
+//  2. Authorization: Bearer <token>           — API clients / CI
+//  3. ?token= query param                     — SSE only (EventSource can't set headers)
+func ExtractTokenFromRequest(r *http.Request) string {
+	if c, err := r.Cookie(cookieName); err == nil && c.Value != "" {
+		return c.Value
+	}
+	if h := r.Header.Get("Authorization"); h != "" {
+		if strings.HasPrefix(h, "Bearer ") {
+			return strings.TrimPrefix(h, "Bearer ")
+		}
+	}
+	if isSSERequest(r) {
+		if t := r.URL.Query().Get("token"); t != "" {
+			return t
+		}
+	}
+	return ""
+}
+
+func isSSERequest(r *http.Request) bool {
+	return strings.Contains(r.Header.Get("Accept"), "text/event-stream") ||
+		strings.HasSuffix(r.URL.Path, "/stream")
 }

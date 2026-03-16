@@ -4,7 +4,6 @@ import { apiFetch } from "../api/index"
 
 const DEFAULT_YAML = `serviceName: orders
 repoName: orders-service
-ownerTeam: payments
 runtime: go
 cicdType: github
 templateVersion: v1
@@ -18,7 +17,6 @@ enableWebhook: false`
 const YAML_FIELDS = [
   { key: "serviceName",     label: "Service Name",      hint: "e.g. orders"         },
   { key: "repoName",        label: "Repo Name",         hint: "e.g. orders-service" },
-  { key: "ownerTeam",       label: "Owner Team",        hint: "e.g. payments"       },
   { key: "runtime",         label: "Runtime",           hint: "go / node / python"  },
   { key: "cicdType",        label: "CI/CD Type",        hint: "github / jenkins"    },
   { key: "templateVersion", label: "Template Version",  hint: "e.g. v1"             },

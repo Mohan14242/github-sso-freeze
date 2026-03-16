@@ -17,29 +17,25 @@ export async function createTemplateVersion(data) {
     body: JSON.stringify(data),
   })
   if (!res || !res.ok) {
-    const text = await res.text()
+    const text = await res?.text()
     throw new Error(text || "Failed to create template version")
   }
   return res.json()
 }
 
 export async function deprecateTemplateVersion(id) {
-  const res = await apiFetch(`/api/template-versions/${id}/deprecate`, {
-    method: "POST",
-  })
+  const res = await apiFetch(`/api/template-versions/${id}/deprecate`, { method: "POST" })
   if (!res || !res.ok) {
-    const text = await res.text()
+    const text = await res?.text()
     throw new Error(text || "Failed to deprecate template version")
   }
   return res.json()
 }
 
 export async function releaseTemplateVersion(id) {
-  const res = await apiFetch(`/api/template-versions/${id}/release`, {
-    method: "POST",
-  })
+  const res = await apiFetch(`/api/template-versions/${id}/release`, { method: "POST" })
   if (!res || !res.ok) {
-    const text = await res.text()
+    const text = await res?.text()
     throw new Error(text || "Failed to release template version")
   }
   return res.json()

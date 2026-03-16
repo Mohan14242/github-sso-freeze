@@ -13,5 +13,5 @@ export async function fetchAuditLogs(filters = {}, page = 1) {
 
   const res = await apiFetch(`/api/audit-logs?${params.toString()}`)
   if (!res || !res.ok) throw new Error("Failed to fetch audit logs")
-  return res.json() // returns { logs, total, page }
+  return res.json()
 }
