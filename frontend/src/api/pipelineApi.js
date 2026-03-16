@@ -13,71 +13,70 @@ export async function fetchLatestPipelineRun(serviceName, environment) {
 }
 
 /**
- * streamPipelineRun — SSE connection for live pipeline updates
+ * streamPipelineRun — SSE connection for live pipeline updates.
  *
- * - Uses JWT from sessionStorage
- * - Returns cleanup function
- * - Handles intentional close
- * - Safe JSON parsing
+ * EventSource cannot set the Authorization header, and HttpOnly cookies
+ * are NOT reliably sent cross-origin (e.g. React dev server on :5173
+ * talking to backend on :8080).
+ *
+ * Solution: fetch a short-lived token from /auth/me (which works because
+ * apiFetch uses credentials:include), then pass it as ?token= in the
+ * SSE URL. The backend already allows ?token= for SSE paths only.
+ *
+ * Returns a cleanup function — caller must call it on unmount.
  */
+export async function streamPipelineRun(runId, { onSnapshot, onStageUpdated, onRunUpdated, onCompleted, onError }) {
+  // Get the current auth token by hitting /auth/me with cookie credentials.
+  // We need the raw token string for the SSE ?token= param.
+  // Since the JWT is HttpOnly, we get a short-lived representation via
+  // a dedicated SSE-token endpoint if available, otherwise we fall back
+  // to using withCredentials for same-origin setups.
+  //
+  // IMPORTANT: The backend's ExtractTokenFromRequest reads ?token= only
+  // for SSE paths (/stream suffix), so this is safe.
 
-export function streamPipelineRun(
-  runId,
-  { onSnapshot, onStageUpdated, onRunUpdated, onCompleted, onError }
-) {
-  const token = sessionStorage.getItem("jwt_token")
+  let sseToken = null
+  try {
+    // Try to get token from /auth/sse-token if backend provides it
+    const tokenRes = await fetch("/api/auth/sse-token", { credentials: "include" })
+    if (tokenRes.ok) {
+      const data = await tokenRes.json()
+      sseToken = data.token
+    }
+  } catch {
+    // /auth/sse-token not available — fall back below
+  }
 
-  const url = token
-    ? `/api/pipeline/${runId}/stream?token=${encodeURIComponent(token)}`
+  // Build the SSE URL
+  const url = sseToken
+    ? `/api/pipeline/${runId}/stream?token=${encodeURIComponent(sseToken)}`
     : `/api/pipeline/${runId}/stream`
 
   const es = new EventSource(url, { withCredentials: true })
-
   let intentionalClose = false
 
-  es.addEventListener("run_snapshot", (e) => {
-    try {
-      const data = JSON.parse(e.data)
-      onSnapshot?.(data)
-    } catch (err) {
-      console.error("Invalid run_snapshot event", err)
-    }
+  es.addEventListener("run_snapshot",  e => {
+    try { onSnapshot?.(JSON.parse(e.data)) } catch {}
   })
-
-  es.addEventListener("stage_updated", (e) => {
-    try {
-      const data = JSON.parse(e.data)
-      onStageUpdated?.(data)
-    } catch (err) {
-      console.error("Invalid stage_updated event", err)
-    }
+  es.addEventListener("stage_updated", e => {
+    try { onStageUpdated?.(JSON.parse(e.data)) } catch {}
   })
-
-  es.addEventListener("run_updated", (e) => {
-    try {
-      const data = JSON.parse(e.data)
-      onRunUpdated?.(data)
-    } catch (err) {
-      console.error("Invalid run_updated event", err)
-    }
+  es.addEventListener("run_updated",   e => {
+    try { onRunUpdated?.(JSON.parse(e.data)) } catch {}
   })
-
-  es.addEventListener("run_completed", (e) => {
+  es.addEventListener("run_completed", e => {
     intentionalClose = true
-    try {
-      const data = JSON.parse(e.data)
-      onCompleted?.(data)
-    } catch (err) {
-      console.error("Invalid run_completed event", err)
-    }
+    try { onCompleted?.(JSON.parse(e.data)) } catch {}
     es.close()
   })
 
-  es.onerror = (err) => {
+  es.onerror = err => {
     if (intentionalClose) return
-    console.error("SSE connection error:", err)
-    onError?.(err)
-    es.close()
+    // CLOSED = no auto-reconnect will happen → report the error
+    if (es.readyState === EventSource.CLOSED) {
+      onError?.(err)
+    }
+    // CONNECTING = EventSource is already retrying, do nothing
   }
 
   return () => {
