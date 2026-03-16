@@ -12,31 +12,76 @@ export async function fetchLatestPipelineRun(serviceName, environment) {
   return res.json()
 }
 
-// SSE — returns an EventSource and cleanup function
-export function streamPipelineRun(runId, { onStageUpdated, onRunUpdated, onCompleted, onSnapshot, onError }) {
+/**
+ * streamPipelineRun — SSE connection for live pipeline updates
+ *
+ * - Uses JWT from sessionStorage
+ * - Returns cleanup function
+ * - Handles intentional close
+ * - Safe JSON parsing
+ */
+
+export function streamPipelineRun(
+  runId,
+  { onSnapshot, onStageUpdated, onRunUpdated, onCompleted, onError }
+) {
   const token = sessionStorage.getItem("jwt_token")
-  const url   = `/api/pipeline/${runId}/stream?token=${encodeURIComponent(token)}`
+
+  const url = token
+    ? `/api/pipeline/${runId}/stream?token=${encodeURIComponent(token)}`
+    : `/api/pipeline/${runId}/stream`
 
   const es = new EventSource(url, { withCredentials: true })
-  let intentionalClose = false  // ← add this
 
-  es.addEventListener("run_snapshot",  e => onSnapshot?.(JSON.parse(e.data)))
-  es.addEventListener("stage_updated", e => onStageUpdated?.(JSON.parse(e.data)))
-  es.addEventListener("run_updated",   e => onRunUpdated?.(JSON.parse(e.data)))
-  es.addEventListener("run_completed", e => {
-    intentionalClose = true      // ← mark before closing
-    onCompleted?.(JSON.parse(e.data))
+  let intentionalClose = false
+
+  es.addEventListener("run_snapshot", (e) => {
+    try {
+      const data = JSON.parse(e.data)
+      onSnapshot?.(data)
+    } catch (err) {
+      console.error("Invalid run_snapshot event", err)
+    }
+  })
+
+  es.addEventListener("stage_updated", (e) => {
+    try {
+      const data = JSON.parse(e.data)
+      onStageUpdated?.(data)
+    } catch (err) {
+      console.error("Invalid stage_updated event", err)
+    }
+  })
+
+  es.addEventListener("run_updated", (e) => {
+    try {
+      const data = JSON.parse(e.data)
+      onRunUpdated?.(data)
+    } catch (err) {
+      console.error("Invalid run_updated event", err)
+    }
+  })
+
+  es.addEventListener("run_completed", (e) => {
+    intentionalClose = true
+    try {
+      const data = JSON.parse(e.data)
+      onCompleted?.(data)
+    } catch (err) {
+      console.error("Invalid run_completed event", err)
+    }
     es.close()
   })
 
   es.onerror = (err) => {
-    if (intentionalClose) return  // ← ignore close-triggered errors
+    if (intentionalClose) return
+    console.error("SSE connection error:", err)
     onError?.(err)
     es.close()
   }
 
   return () => {
-    intentionalClose = true       // ← also mark when caller cleans up
+    intentionalClose = true
     es.close()
   }
 }
