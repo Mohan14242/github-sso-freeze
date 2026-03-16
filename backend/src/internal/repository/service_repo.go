@@ -2,17 +2,52 @@ package repository
 
 import (
 	"database/sql"
+	"fmt"
+	"strings"
+
 	"src/src/internal/db"
 )
 
+// GetServices returns all services.
+// Used by admin/operator roles via handler.GetServices.
 func GetServices() ([]map[string]interface{}, error) {
-	rows, err := db.DB.Query(`
+	return getServicesFiltered(nil)
+}
+
+// GetServicesForTeams returns only services whose service_name is in the
+// provided team slugs list. Used for developer and readonly roles.
+func GetServicesForTeams(teams []string) ([]map[string]interface{}, error) {
+	if len(teams) == 0 {
+		return []map[string]interface{}{}, nil
+	}
+	return getServicesFiltered(teams)
+}
+
+func getServicesFiltered(teams []string) ([]map[string]interface{}, error) {
+	query := `
 		SELECT s.id, s.service_name, s.repo_name, s.owner_team,
 		       s.runtime, s.cicd_type, s.template_version, s.deploy_type,
 		       d.environment, d.status
 		FROM services s
-		LEFT JOIN deployments d ON s.id = d.service_id
-	`)
+		LEFT JOIN deployments d ON s.id = d.service_id`
+
+	args := []interface{}{}
+
+	if len(teams) > 0 {
+		placeholders := make([]string, len(teams))
+		for i, t := range teams {
+			placeholders[i] = "?"
+			args = append(args, t)
+		}
+		query += fmt.Sprintf(
+			" WHERE s.service_name IN (%s)",
+			strings.Join(placeholders, ","),
+		)
+	}
+
+	query += " ORDER BY s.created_at DESC"
+
+	rows, err := db.DB.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -22,8 +57,8 @@ func GetServices() ([]map[string]interface{}, error) {
 
 	for rows.Next() {
 		var (
-			id int64
-			env, status sql.NullString
+			id                                                       int64
+			env, status                                              sql.NullString
 			serviceName, repoName, ownerTeam, runtime, cicd, tpl, deploy string
 		)
 
@@ -51,11 +86,10 @@ func GetServices() ([]map[string]interface{}, error) {
 		}
 	}
 
-	var services []map[string]interface{}
+	services := make([]map[string]interface{}, 0, len(result))
 	for _, v := range result {
 		services = append(services, v)
 	}
-
 	return services, nil
 }
 
@@ -65,6 +99,5 @@ func UpdateDeployment(serviceName, env, status string) error {
 		SELECT id, ?, ? FROM services WHERE service_name = ?
 		ON DUPLICATE KEY UPDATE status = ?, updated_at = NOW()
 	`, env, status, serviceName, status)
-
 	return err
 }

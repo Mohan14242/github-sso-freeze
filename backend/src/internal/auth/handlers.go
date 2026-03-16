@@ -43,7 +43,9 @@ func HandleLogin(w http.ResponseWriter, r *http.Request) {
 	redirectURI := os.Getenv("GITHUB_REDIRECT_URI")
 
 	if clientID == "" || redirectURI == "" {
-		log.Error("OAuth not configured", "client_id_present", clientID != "", "redirect_uri_present", redirectURI != "")
+		log.Error("OAuth not configured",
+			"client_id_present", clientID != "",
+			"redirect_uri_present", redirectURI != "")
 		http.Error(w, "OAuth not configured", http.StatusInternalServerError)
 		return
 	}
@@ -146,19 +148,10 @@ func HandleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Handle role
+	// Handle role error
 	if rr.err != nil {
 		log.Error("role determination failed", "error", rr.err)
 		redirectError(w, r, "role_check_failed")
-		return
-	}
-	if rr.role == "" {
-		log.Warn("no platform role assigned")
-		audit.Log(r, audit.Entry{
-			Action: "login", ResourceType: "auth", ResourceName: user.Login,
-			Status: "rejected", Details: "no team role assigned",
-		})
-		redirectError(w, r, "no_role_assigned")
 		return
 	}
 
@@ -167,6 +160,26 @@ func HandleCallback(w http.ResponseWriter, r *http.Request) {
 	if tr.err != nil {
 		log.Warn("could not fetch all teams, using empty list", "error", tr.err)
 		allTeams = []string{}
+	}
+
+	// If user has no platform role but belongs to at least one service team,
+	// automatically grant developer role scoped to those teams.
+	// This means service team members (e.g. "orders" team) can log in
+	// without needing to be manually added to the "developers" platform team.
+	if rr.role == "" {
+		if len(allTeams) > 0 {
+			rr.role = "developer"
+			log.Info("no platform role — assigned developer via service team membership",
+				"login", user.Login, "teams", allTeams)
+		} else {
+			log.Warn("no platform role and no service teams assigned", "login", user.Login)
+			audit.Log(r, audit.Entry{
+				Action: "login", ResourceType: "auth", ResourceName: user.Login,
+				Status: "rejected", Details: "no platform role and no org team membership",
+			})
+			redirectError(w, r, "no_role_assigned")
+			return
+		}
 	}
 
 	log.Info("login resolved", "role", rr.role, "team_count", len(allTeams))
@@ -397,7 +410,8 @@ func fetchAllUserTeams(ctx context.Context, token string) ([]string, error) {
 }
 
 func checkTeamMembership(ctx context.Context, token, team, login string) (bool, error) {
-	url := fmt.Sprintf("https://api.github.com/orgs/%s/teams/%s/memberships/%s", githubOrg, team, login)
+	url := fmt.Sprintf("https://api.github.com/orgs/%s/teams/%s/memberships/%s",
+		githubOrg, team, login)
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return false, err
